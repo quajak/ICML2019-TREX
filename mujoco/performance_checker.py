@@ -1,7 +1,6 @@
 def gen_traj_dist(env,agent,render=False,max_len=99999):
     ob = env.reset()
 
-    from mujoco_py.generated import const
     unwrapped = env
     while hasattr(unwrapped,'env'):
         unwrapped = unwrapped.env
@@ -24,7 +23,6 @@ def gen_traj_dist(env,agent,render=False,max_len=99999):
 def gen_traj_return(env,agent,render=False,max_len=99999):
     ob = env.reset()
 
-    from mujoco_py.generated import const
     unwrapped = env
     while hasattr(unwrapped,'env'):
         unwrapped = unwrapped.env

@@ -1,0 +1,7 @@
+*.pyc
+mujoco/models
+mujoco/runs
+mujoco/trex_models
+mujoco/trex_runs
+mujoco/wandb
+mujoco/trex_log

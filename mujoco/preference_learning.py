@@ -1,79 +1,23 @@
 import argparse
 from pathlib import Path
 import numpy as np
-import tensorflow as tf
-import gym
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import gymnasium as gym
 from tqdm import tqdm
 import matplotlib
+import wandb
+from stable_baselines3 import PPO
+from stable_baselines3.common.vec_env import DummyVecEnv
+
+from model import Model
+from custom_reward_wrapper import TorchPreferenceRewardNormalized, VecTorchPreferenceRewardNormalized
 matplotlib.use('agg')
 from matplotlib import pyplot as plt
 from imgcat import imgcat
+from wandb.integration.sb3 import WandbCallback
 
-# Import my own libraries
-import os, sys
-sys.path.append(os.path.dirname(os.path.abspath(__file__))+'/learner/baselines/')
-os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3' # Only show ERROR log
-from tf_commons.ops import *
-
-class PPO2Agent(object):
-    def __init__(self, env, env_type, path, stochastic=False, gpu=True):
-        from baselines.common.policies import build_policy
-        from baselines.ppo2.model import Model
-
-        self.graph = tf.Graph()
-
-        if gpu:
-            config = tf.ConfigProto()
-            config.gpu_options.allow_growth = True
-        else:
-            config = tf.ConfigProto(device_count = {'GPU': 0})
-
-        self.sess = tf.Session(graph=self.graph,config=config)
-
-        with self.graph.as_default():
-            with self.sess.as_default():
-                ob_space = env.observation_space
-                ac_space = env.action_space
-
-                if env_type == 'atari':
-                    policy = build_policy(env,'cnn')
-                elif env_type == 'mujoco':
-                    policy = build_policy(env,'mlp')
-                else:
-                    assert False,' not supported env_type'
-
-                make_model = lambda : Model(policy=policy, ob_space=ob_space, ac_space=ac_space, nbatch_act=1, nbatch_train=1,
-                                nsteps=1, ent_coef=0., vf_coef=0.,
-                                max_grad_norm=0.)
-                self.model = make_model()
-
-                self.model_path = path
-                self.model.load(path)
-
-        if env_type == 'mujoco':
-            with open(path+'.env_stat.pkl', 'rb') as f :
-                import pickle
-                s = pickle.load(f)
-            self.ob_rms = s['ob_rms']
-            self.ret_rms = s['ret_rms']
-            self.clipob = 10.
-            self.epsilon = 1e-8
-        else:
-            self.ob_rms = None
-
-        self.stochastic = stochastic
-
-    def act(self, obs, reward, done):
-        if self.ob_rms:
-            obs = np.clip((obs - self.ob_rms.mean) / np.sqrt(self.ob_rms.var + self.epsilon), -self.clipob, self.clipob)
-
-        with self.graph.as_default():
-            with self.sess.as_default():
-                if self.stochastic:
-                    a,v,state,neglogp = self.model.step(obs)
-                else:
-                    a = self.model.act_model.act(obs)
-        return a
 
 class RandomAgent(object):
     """The world's simplest agent!"""
@@ -84,190 +28,6 @@ class RandomAgent(object):
     def act(self, observation, reward, done):
         return self.action_space.sample()[None]
 
-class Model(object):
-    def __init__(self,include_action,ob_dim,ac_dim,batch_size=64,num_layers=2,embedding_dims=256,steps=None):
-        self.include_action = include_action
-        in_dims = ob_dim+ac_dim if include_action else ob_dim
-
-        self.inp = tf.placeholder(tf.float32,[None,in_dims])
-        self.x = tf.placeholder(tf.float32,[None,in_dims]) #[B*steps,in_dim]
-        self.y = tf.placeholder(tf.float32,[None,in_dims])
-        self.x_split = tf.placeholder(tf.int32,[batch_size]) # B-lengthed vector indicating the size of each steps
-        self.y_split = tf.placeholder(tf.int32,[batch_size]) # B-lengthed vector indicating the size of each steps
-        self.l = tf.placeholder(tf.int32,[batch_size]) # [0 when x is better 1 when y is better]
-        self.l2_reg = tf.placeholder(tf.float32,[]) # [0 when x is better 1 when y is better]
-
-        with tf.variable_scope('weights') as param_scope:
-            self.fcs = []
-            last_dims = in_dims
-            for l in range(num_layers):
-                self.fcs.append(Linear('fc%d'%(l+1),last_dims,embedding_dims)) #(l+1) is gross, but for backward compatibility
-                last_dims = embedding_dims
-            self.fcs.append(Linear('fc%d'%(num_layers+1),last_dims,1))
-
-        self.param_scope = param_scope
-
-        # build graph
-        def _reward(x):
-            for fc in self.fcs[:-1]:
-                x = tf.nn.relu(fc(x))
-            r = tf.squeeze(self.fcs[-1](x),axis=1)
-            return x, r
-
-        self.fv, self.r = _reward(self.inp)
-
-        _, rs_xs = _reward(self.x)
-        self.v_x = tf.stack([tf.reduce_sum(rs_x) for rs_x in tf.split(rs_xs,self.x_split,axis=0)],axis=0)
-
-        _, rs_ys = _reward(self.y)
-        self.v_y = tf.stack([tf.reduce_sum(rs_y) for rs_y in tf.split(rs_ys,self.y_split,axis=0)],axis=0)
-
-        logits = tf.stack([self.v_x,self.v_y],axis=1) #[None,2]
-        loss = tf.nn.sparse_softmax_cross_entropy_with_logits(logits=logits,labels=self.l)
-        self.loss = tf.reduce_mean(loss,axis=0)
-
-        weight_decay = 0.
-        for fc in self.fcs:
-            weight_decay += tf.reduce_sum(fc.w**2)
-
-        self.l2_loss = self.l2_reg * weight_decay
-
-        pred = tf.cast(tf.greater(self.v_y,self.v_x),tf.int32)
-        self.acc = tf.reduce_mean(tf.cast(tf.equal(pred,self.l),tf.float32))
-
-        self.optim = tf.train.AdamOptimizer(1e-4)
-        self.update_op = self.optim.minimize(self.loss+self.l2_loss,var_list=self.parameters(train=True))
-
-        self.saver = tf.train.Saver(var_list=self.parameters(train=False),max_to_keep=0)
-
-    def parameters(self,train=False):
-        if train:
-            return tf.trainable_variables(self.param_scope.name)
-        else:
-            return tf.get_collection(tf.GraphKeys.GLOBAL_VARIABLES,self.param_scope.name)
-
-    def train(self,D,batch_size=64,iter=10000,l2_reg=0.01,noise_level=0.1,debug=False):
-        """
-        Training will be early-terminate when validation accuracy becomes large enough..?
-
-        args:
-            D: list of triplets (\sigma^1,\sigma^2,\mu)
-            while
-                sigma^{1,2}: shape of [steps,in_dims]
-                mu : 0 or 1
-        """
-        sess = tf.get_default_session()
-
-        idxes = np.random.permutation(len(D))
-        train_idxes = idxes[:int(len(D)*0.8)]
-        valid_idxes = idxes[int(len(D)*0.8):]
-
-        def _batch(idx_list,add_noise):
-            batch = []
-
-            if len(idx_list) > batch_size:
-                idxes = np.random.choice(idx_list,batch_size,replace=False)
-            else:
-                idxes = idx_list
-
-            for i in idxes:
-                batch.append(D[i])
-
-            b_x,b_y,b_l = zip(*batch)
-            x_split = np.array([len(x) for x in b_x])
-            y_split = np.array([len(y) for y in b_y])
-            b_x,b_y,b_l = np.concatenate(b_x,axis=0),np.concatenate(b_y,axis=0),np.array(b_l)
-
-            if add_noise:
-                b_l = (b_l + np.random.binomial(1,noise_level,batch_size)) % 2 #Flip it with probability 0.1
-
-            return b_x,b_y,x_split,y_split,b_l
-
-        for it in tqdm(range(iter),dynamic_ncols=True):
-            b_x,b_y,x_split,y_split,b_l = _batch(train_idxes,add_noise=True)
-
-            loss,l2_loss,acc,_ = sess.run([self.loss,self.l2_loss,self.acc,self.update_op],feed_dict={
-                self.x:b_x,
-                self.y:b_y,
-                self.x_split:x_split,
-                self.y_split:y_split,
-                self.l:b_l,
-                self.l2_reg:l2_reg,
-            })
-
-            if debug:
-                if it % 100 == 0 or it < 10:
-                    b_x,b_y,x_split,y_split,b_l = _batch(valid_idxes,add_noise=False)
-                    valid_acc = sess.run(self.acc,feed_dict={
-                        self.x:b_x,
-                        self.y:b_y,
-                        self.x_split:x_split,
-                        self.y_split:y_split,
-                        self.l:b_l
-                    })
-                    tqdm.write(('loss: %f (l2_loss: %f), acc: %f, valid_acc: %f'%(loss,l2_loss,acc,valid_acc)))
-
-            #if valid_acc >= 0.95:
-            #    print('loss: %f (l2_loss: %f), acc: %f, valid_acc: %f'%(loss,l2_loss,acc,valid_acc))
-            #    print('early termination@%08d'%it)
-            #    break
-
-    def train_with_dataset(self,dataset,batch_size,include_action=False,iter=10000,l2_reg=0.01,debug=False):
-        sess = tf.get_default_session()
-
-        for it in tqdm(range(iter),dynamic_ncols=True):
-            b_x,b_y,x_split,y_split,b_l = dataset.batch(batch_size=batch_size,include_action=include_action)
-            loss,l2_loss,acc,_ = sess.run([self.loss,self.l2_loss,self.acc,self.update_op],feed_dict={
-                self.x:b_x,
-                self.y:b_y,
-                self.x_split:x_split,
-                self.y_split:y_split,
-                self.l:b_l,
-                self.l2_reg:l2_reg,
-            })
-
-            if debug:
-                if it % 100 == 0 or it < 10:
-                    tqdm.write(('loss: %f (l2_loss: %f), acc: %f'%(loss,l2_loss,acc)))
-
-    def eval(self,D,batch_size=64):
-        sess = tf.get_default_session()
-
-        b_x,b_y,b_l = zip(*D)
-        b_x,b_y,b_l = np.array(b_x),np.array(b_y),np.array(b_l)
-
-        b_r_x, b_acc = [], 0.
-
-        for i in range(0,len(b_x),batch_size):
-            sum_r_x, acc = sess.run([self.sum_r_x,self.acc],feed_dict={
-                self.x:b_x[i:i+batch_size],
-                self.y:b_y[i:i+batch_size],
-                self.l:b_l[i:i+batch_size]
-            })
-
-            b_r_x.append(sum_r_x)
-            b_acc += len(sum_r_x)*acc
-
-        return np.concatenate(b_r_x,axis=0), b_acc/len(b_x)
-
-    def get_reward(self,obs,acs,batch_size=1024):
-        sess = tf.get_default_session()
-
-        if self.include_action:
-            inp = np.concatenate((obs,acs),axis=1)
-        else:
-            inp = obs
-
-        b_r = []
-        for i in range(0,len(obs),batch_size):
-            r = sess.run(self.r,feed_dict={
-                self.inp:inp[i:i+batch_size]
-            })
-
-            b_r.append(r)
-
-        return np.concatenate(b_r,axis=0)
-
 class GTDataset(object):
     def __init__(self,env):
         self.env = env
@@ -275,15 +35,18 @@ class GTDataset(object):
         while hasattr(self.unwrapped,'env'):
             self.unwrapped = self.unwrapped.env
 
-    def gen_traj(self,agent,min_length):
+    def gen_traj(self, agent: PPO, min_length: int):
         max_x_pos = -99999
 
-        obs, actions, rewards = [self.env.reset()], [], []
-        while True:
-            action = agent.act(obs[-1], None, None)
-            ob, reward, done, _ = self.env.step(action)
-            if self.unwrapped.sim.data.qpos[0] > max_x_pos:
-                max_x_pos = self.unwrapped.sim.data.qpos[0]
+        first_obs, _ = self.env.reset()
+        obs, actions, rewards = [first_obs], [], []
+        while len(obs) < 1000:  # we collect 1000 steps of trajectory for each agent
+            action, _ = agent.predict(obs[-1], None, None)
+            ob, reward, done, _, info = self.env.step(action)
+            if len(action.shape) == 0:
+                action = action[None]
+            if info['x_position'] > max_x_pos:
+                max_x_pos = info['x_position']
 
             obs.append(ob)
             actions.append(action)
@@ -292,12 +55,13 @@ class GTDataset(object):
             if done:
                 if len(obs) < min_length:
                     obs.pop()
-                    obs.append(self.env.reset())
+                    ob, _= self.env.reset()
+                    obs.append(ob)
                 else:
                     obs.pop()
                     break
 
-        return (np.stack(obs,axis=0), np.concatenate(actions,axis=0), np.array(rewards)), max_x_pos
+        return (np.stack(obs, axis=0), np.concatenate(actions, axis=0), np.array(rewards)), max_x_pos
 
     def prebuilt(self,agents,min_length):
         assert len(agents)>0, 'no agent given'
@@ -306,13 +70,13 @@ class GTDataset(object):
             traj, max_x_pos = self.gen_traj(agent,min_length)
 
             trajs.append(traj)
-            tqdm.write('model: %s avg reward: %f max_x_pos: %f'%(agent.model_path,np.sum(traj[2]),max_x_pos))
+            tqdm.write('model: %s avg reward: %f max_x_pos: %f'%(agent.model_path, np.sum(traj[2]), max_x_pos))
         obs,actions,rewards = zip(*trajs)
         self.trajs = (np.concatenate(obs,axis=0),np.concatenate(actions,axis=0),np.concatenate(rewards,axis=0))
 
         print(self.trajs[0].shape,self.trajs[1].shape,self.trajs[2].shape)
 
-    def sample(self,num_samples,steps=40,include_action=False):
+    def sample(self,num_samples,steps=40, include_action=False):
         obs, actions, rewards = self.trajs
 
         D = []
@@ -340,21 +104,27 @@ class GTTrajLevelDataset(GTDataset):
     def prebuilt(self,agents,min_length):
         assert len(agents)>0, 'no agent is given'
 
+        tqdm.write("Generating Trajectories")
         trajs = []
+        max_max_x = -99999
         for agent_idx,agent in enumerate(tqdm(agents)):
-            (obs,actions,rewards),_ = self.gen_traj(agent,min_length)
+            (obs,actions,rewards), max_x = self.gen_traj(agent,min_length)
             trajs.append((agent_idx,obs,actions,rewards))
+            tqdm.write(f'Generated trajectory for agent {agent_idx} with reward {np.sum(rewards)} and max_x {max_x}')
+            if max_x > max_max_x:
+                max_max_x = max_x
 
+        print('best max_x:', max_max_x)
         self.trajs = trajs
 
         _idxes = np.argsort([np.sum(rewards) for _,_,_,rewards in self.trajs]) # rank 0 is the most bad demo.
         self.trajs_rank = np.empty_like(_idxes)
         self.trajs_rank[_idxes] = np.arange(len(_idxes))
 
-    def sample(self,num_samples,steps=40,include_action=False):
+    def sample(self, num_samples, steps=50,include_action=False):
         D = []
         GT_preference = []
-        for _ in tqdm(range(num_samples)):
+        for _ in range(num_samples):
             x_idx,y_idx = np.random.choice(len(self.trajs),2,replace=False)
 
             x_traj = self.trajs[x_idx]
@@ -376,15 +146,15 @@ class GTTrajLevelDataset(GTDataset):
 
             GT_preference.append(0 if np.sum(x_traj[3][x_ptr:x_ptr+steps]) > np.sum(y_traj[3][y_ptr:y_ptr+steps]) else 1)
 
-        print('------------------')
-        _,_,preference = zip(*D)
-        preference = np.array(preference).astype(np.bool)
-        GT_preference = np.array(GT_preference).astype(np.bool)
-        print('Quality of time-indexed preference (0-1):', np.count_nonzero(preference == GT_preference) / len(preference))
-        print('------------------')
+        # print('------------------')
+        # _,_,preference = zip(*D)
+        # preference = np.array(preference).astype(bool)
+        # GT_preference = np.array(GT_preference).astype(bool)
+        # print('Quality of time-indexed preference (0-1):', np.count_nonzero(preference == GT_preference) / len(preference))
+        # print('------------------')
 
         return D
-
+    
 class GTTrajLevelNoStepsDataset(GTTrajLevelDataset):
     def __init__(self,env,max_steps):
         super().__init__(env)
@@ -574,9 +344,9 @@ class LearnerDataset(GTTrajLevelDataset):
 def train(args):
     logdir = Path(args.log_dir)
 
-    if logdir.exists() :
-        c = input('log dir is already exist. continue to train a preference model? [Y/etc]? ')
-        if c in ['YES','yes','Y']:
+    if logdir.exists():
+        c = 'y' # input('log dir already exists. continue to train a preference model? [Y/etc]? ')
+        if len(c) == 0 or 'y' in c.lower():
             import shutil
             shutil.rmtree(str(logdir))
         else:
@@ -584,120 +354,184 @@ def train(args):
             return
 
     logdir.mkdir(parents=True)
-    with open(str(logdir/'args.txt'),'w') as f:
-        f.write( str(args) )
+    with open(str(logdir/'args.txt'), 'w') as f:
+        f.write(str(args))
 
     logdir = str(logdir)
     env = gym.make(args.env_id)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+    # Initialize agents
     train_agents = [RandomAgent(env.action_space)] if args.random_agent else []
 
-    models = sorted([p for p in Path(args.learners_path).glob('?????') if int(p.name) <= args.max_chkpt])
+    models = sorted([p for p in (Path(args.learners_path) / args.env_id).glob('*') if int(p.name.strip(".zip")) <= args.max_chkpt])
     for path in models:
-        agent = PPO2Agent(env,args.env_type,str(path),stochastic=args.stochastic)
+        agent = PPO.load(path, device='cpu')
+        setattr(agent,'model_path',str(path))
+        print(f'Loaded agent from {path}')
         train_agents.append(agent)
 
+    # Initialize dataset based on preference type
     if args.preference_type == 'gt':
         dataset = GTDataset(env)
     elif args.preference_type == 'gt_traj':
         dataset = GTTrajLevelDataset(env)
     elif args.preference_type == 'gt_traj_no_steps':
-        dataset = GTTrajLevelNoStepsDataset(env,args.max_steps)
+        dataset = GTTrajLevelNoStepsDataset(env, args.max_steps)
     elif args.preference_type == 'gt_traj_no_steps_noise':
-        dataset = GTTrajLevelNoSteps_Noise_Dataset(env,args.max_steps,args.traj_noise)
+        dataset = GTTrajLevelNoSteps_Noise_Dataset(env, args.max_steps, args.traj_noise)
     elif args.preference_type == 'gt_traj_no_steps_n_mix':
-        dataset = GTTrajLevelNoSteps_N_Mix_Dataset(env,args.N,args.max_steps)
+        dataset = GTTrajLevelNoSteps_N_Mix_Dataset(env, args.N, args.max_steps)
     elif args.preference_type == 'time':
-        dataset = LearnerDataset(env,args.min_margin)
+        dataset = LearnerDataset(env, args.min_margin)
     else:
-        assert False, 'specify prefernce type'
+        raise ValueError('Invalid preference type')
 
-    dataset.prebuilt(train_agents,args.min_length)
+    dataset.prebuilt(train_agents, args.min_length)
 
+    # Initialize models
     models = []
     for i in range(args.num_models):
-        with tf.variable_scope('model_%d'%i):
-            models.append(Model(args.include_action,env.observation_space.shape[0],env.action_space.shape[0],steps=args.steps,num_layers=args.num_layers,embedding_dims=args.embedding_dims))
+        model = Model(
+            include_action=args.include_action,
+            ob_dim=env.observation_space.shape[0],
+            ac_dim=env.action_space.shape[0],
+            num_layers=args.num_layers,
+            embedding_dims=args.embedding_dims,
+            device=device
+        )
+        models.append(model)
 
-    ### Initialize Parameters
-    init_op = tf.group(tf.global_variables_initializer(),
-                        tf.local_variables_initializer())
-    # Training configuration
-    config = tf.ConfigProto()
-    config.gpu_options.allow_growth = True
-    sess = tf.InteractiveSession()
-
-    sess.run(init_op)
-
-    for i,model in enumerate(models):
-        D = dataset.sample(args.D,args.steps,include_action=args.include_action)
+    # Train each model
+    for i, model in enumerate(iterable=models):
+        print(f"Training model {i+1}/{args.num_models}")
+        
+        D = dataset.sample(args.D, args.steps, include_action=args.include_action)
 
         if D is None:
-            model.train_with_dataset(dataset,64,include_action=args.include_action,debug=True)
+            model.train_model(
+                dataset,
+                batch_size=64,
+                num_epochs=args.iter,
+                l2_reg=args.l2_reg,
+                noise_level=args.noise,
+                debug=True
+            )
         else:
-            model.train(D,l2_reg=args.l2_reg,noise_level=args.noise,debug=True)
+            # Convert dataset to PyTorch format
+            x_data = [torch.FloatTensor(x) for x, _, _ in D]
+            y_data = [torch.FloatTensor(y) for _, y, _ in D]
+            labels = torch.LongTensor([l for _, _, l in D])
+            
+            dataset_torch = {
+                'x': x_data,
+                'y': y_data,
+                'labels': labels
+            }
+            
+            model.train_model(
+                # dataset_torch,
+                dataset,
+                batch_size=args.batch_size,
+                num_epochs=args.iter,
+                l2_reg=args.l2_reg,
+                noise_level=args.noise,
+                debug=True
+            )
 
-        model.saver.save(sess,logdir+'/model_%d.ckpt'%(i),write_meta_graph=False)
+        # Save model
+        torch.save(model.state_dict(), f"{logdir}/model_{i}.pt")
+        # Save model configuration separately for loading
+        model_config = {
+            'include_action': args.include_action,
+            'ob_dim': env.observation_space.shape[0],
+            'ac_dim': env.action_space.shape[0],
+            'num_layers': args.num_layers,
+            'embedding_dims': args.embedding_dims
+        }
+        torch.save(model_config, f"{logdir}/model_{i}_config.pt")
 
 def eval(args):
     logdir = str(Path(args.logbase_path) / args.env_id)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     env = gym.make(args.env_id)
 
+    # Initialize validation agents
     valid_agents = []
     models = sorted(Path(args.learners_path).glob('?????'))
     for path in models:
         if path.name > args.max_chkpt:
             continue
-        agent = PPO2Agent(env,args.env_type,str(path),stochastic=args.stochastic)
+        agent = PPO2Agent(env, str(path), stochastic=args.stochastic, device=device)
         valid_agents.append(agent)
 
+    # Initialize test agents
     test_agents = []
-    for i,path in enumerate(models):
+    for i, path in enumerate(models):
         if i % 10 == 0:
-            agent = PPO2Agent(env,args.env_type,str(path),stochastic=args.stochastic)
+            agent = PPO2Agent(env, str(path), stochastic=args.stochastic, device=device)
             test_agents.append(agent)
 
-    gt_dataset= GTDataset(env)
-    gt_dataset.prebuilt(valid_agents,-1)
+    # Prepare datasets
+    gt_dataset = GTDataset(env)
+    gt_dataset.prebuilt(valid_agents, -1)
 
     gt_dataset_test = GTDataset(env)
-    gt_dataset_test.prebuilt(test_agents,-1)
+    gt_dataset_test.prebuilt(test_agents, -1)
 
-    models = []
+    # Load and evaluate models
     for i in range(args.num_models):
-        with tf.variable_scope('model_%d'%i):
-            models.append(Model(args.include_action,env.observation_space.shape[0],env.action_space.shape[0],steps=args.steps))
+        # Load model configuration
+        model_config = torch.load(f"{logdir}/model_{i}_config.pt")
+        model = Model(**model_config, device=device)
+        model.load_state_dict(torch.load(f"{logdir}/model_{i}.pt"))
+        model.eval()
 
-    ### Initialize Parameters
-    init_op = tf.group(tf.global_variables_initializer(),
-                        tf.local_variables_initializer())
-    # Training configuration
-    config = tf.ConfigProto()
-    config.gpu_options.allow_growth = True
-    sess = tf.InteractiveSession()
-
-    sess.run(init_op)
-
-    for i,model in enumerate(models):
-        model.saver.restore(sess,logdir+'/model_%d.ckpt'%(i))
-
-        print('model %d'%i)
+        print(f'Evaluating model {i}')
+        
+        # Convert numpy arrays to torch tensors
         obs, acs, r = gt_dataset.trajs
-        r_hat = model.get_reward(obs, acs)
+        obs_tensor = torch.FloatTensor(obs).to(device)
+        acs_tensor = torch.FloatTensor(acs).to(device) if args.include_action else None
+        
+        # Get predicted rewards
+        with torch.no_grad():
+            r_hat = model.compute_reward(obs_tensor, acs_tensor).squeeze()
 
-        obs, acs, r_test = gt_dataset_test.trajs
-        r_hat_test = model.get_reward(obs, acs)
+        # Do the same for test data
+        obs_test, acs_test, r_test = gt_dataset_test.trajs
+        obs_test_tensor = torch.FloatTensor(obs_test).to(device)
+        acs_test_tensor = torch.FloatTensor(acs_test).to(device) if args.include_action else None
+        
+        with torch.no_grad():
+            r_hat_test = model.compute_reward(obs_test_tensor, acs_test_tensor).squeeze()
 
-        fig,axes = plt.subplots(1,2)
-        axes[0].plot(r,r_hat,'o')
-        axes[1].plot(r_test,r_hat_test,'o')
-        fig.savefig('model_%d.png'%i)
+        # Plot results
+        fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+        axes[0].plot(r, r_hat, 'o', alpha=0.5)
+        axes[0].set_title('Training Data')
+        axes[0].set_xlabel('True Rewards')
+        axes[0].set_ylabel('Predicted Rewards')
+        
+        axes[1].plot(r_test, r_hat_test, 'o', alpha=0.5)
+        axes[1].set_title('Test Data')
+        axes[1].set_xlabel('True Rewards')
+        axes[1].set_ylabel('Predicted Rewards')
+        
+        plt.tight_layout()
+        fig.savefig(f'model_{i}_evaluation.png')
         imgcat(fig)
         plt.close(fig)
 
-        np.savez('model_%d.npz'%i,r=r,r_hat=r_hat,r_test=r_test,r_hat_test=r_hat_test)
-
+        # Save evaluation results
+        np.savez(
+            f'model_{i}_evaluation.npz',
+            r=r,
+            r_hat=r_hat.cpu().numpy(),
+            r_test=r_test,
+            r_hat_test=r_hat_test.cpu().numpy()
+        )
 
 if __name__ == "__main__":
     # Required Args (target envs & learners)
@@ -705,20 +539,20 @@ if __name__ == "__main__":
     parser.add_argument('--env_id', default='', help='Select the environment to run')
     parser.add_argument('--env_type', default='', help='mujoco or atari')
     parser.add_argument('--learners_path', default='', help='path of learning agents')
-    parser.add_argument('--max_chkpt', default=240, type=int, help='decide upto what learner stage you want to give')
-    parser.add_argument('--steps', default=None, type=int, help='length of snippets')
-    parser.add_argument('--max_steps', default=None, type=int, help='length of max snippets (gt_traj_no_steps only)')
+    parser.add_argument('--max_chkpt', default=64000, type=int, help='decide upto what learner stage you want to give')
+    parser.add_argument('--steps', default=40, type=int, help='length of snippets')
+    parser.add_argument('--max_steps', default=100_000, type=int, help='length of max snippets (gt_traj_no_steps only)')  # idk
     parser.add_argument('--traj_noise', default=None, type=int, help='number of adjacent swaps (gt_traj_no_steps_noise only)')
     parser.add_argument('--min_length', default=1000,type=int, help='minimum length of trajectory generated by each agent')
-    parser.add_argument('--num_layers', default=2, type=int, help='number layers of the reward network')
+    parser.add_argument('--num_layers', default=3, type=int, help='number layers of the reward network')
     parser.add_argument('--embedding_dims', default=256, type=int, help='embedding dims')
-    parser.add_argument('--num_models', default=3, type=int, help='number of models to ensemble')
+    parser.add_argument('--num_models', default=5, type=int, help='number of models to ensemble')
     parser.add_argument('--l2_reg', default=0.01, type=float, help='l2 regularization size')
     parser.add_argument('--noise', default=0.1, type=float, help='noise level to add on training label')
     parser.add_argument('--D', default=1000, type=int, help='|D| in the preference paper')
     parser.add_argument('--N', default=10, type=int, help='number of trajactory mix (gt_traj_no_steps_n_mix only)')
     parser.add_argument('--log_dir', required=True)
-    parser.add_argument('--preference_type', help='gt or gt_traj or time or gt_traj_no_steps, gt_traj_no_steps_n_mix; if gt then preference will be given as a GT reward, otherwise, it is given as a time index')
+    parser.add_argument('--preference_type', default='gt_traj', help='gt or gt_traj or time or gt_traj_no_steps, gt_traj_no_steps_n_mix; if gt then preference will be given as a GT reward, otherwise, it is given as a time index')
     parser.add_argument('--min_margin', default=1, type=int, help='when prefernce type is "time", the minimum margin that we can assure there exist a margin')
     parser.add_argument('--include_action', action='store_true', help='whether to include action for the model or not')
     parser.add_argument('--stochastic', action='store_true', help='whether want to use stochastic agent or not')
@@ -727,10 +561,14 @@ if __name__ == "__main__":
     # Args for PPO
     parser.add_argument('--rl_runs', default=1, type=int)
     parser.add_argument('--ppo_log_path', default='ppo2')
-    parser.add_argument('--custom_reward', required=True, help='preference or preference_normalized')
+    parser.add_argument('--custom_reward', default="preference_normalized", help='preference or preference_normalized')
     parser.add_argument('--ctrl_coeff', default=0.0, type=float)
     parser.add_argument('--alive_bonus', default=0.0, type=float)
     parser.add_argument('--gamma', default=0.99, type=float)
+    parser.add_argument('--ppo_policy', default="MlpPolicy", type=str)
+    parser.add_argument('--batch_size', default=64, type=int)  # from paper section 5.1.2
+    parser.add_argument('--iter', default=10000, type=int)
+    parser.add_argument('--num_envs', default=4, type=int)
     args = parser.parse_args()
 
     if not args.eval :
@@ -738,53 +576,71 @@ if __name__ == "__main__":
         train(args)
 
         # Train an agent
-        import os, subprocess
-        openai_logdir = Path(os.path.abspath(os.path.join(args.log_dir,args.ppo_log_path)))
-        if openai_logdir.exists():
-            print('openai_logdir is already exist.')
-            exit()
-
-        template = 'python -m baselines.run --alg=ppo2 --env={env} --num_timesteps=1e6 --save_interval=10 --custom_reward {custom_reward} --custom_reward_kwargs="{kwargs}" --gamma {gamma}'
-        kwargs = {
-            "num_models":args.num_models,
-            "include_action":args.include_action,
-            "model_dir":os.path.abspath(args.log_dir),
-            "num_layers":args.num_layers,
-            "embedding_dims":args.embedding_dims,
-            "ctrl_coeff":args.ctrl_coeff,
-            "alive_bonus":args.alive_bonus
+        import time
+        group = str(time.time())
+        config = {
+            "policy_type": "MlpPolicy",
+            "total_timesteps": 100_000,
+            "env_id": args.env_id,
         }
 
-        # Write down some log
-        openai_logdir.mkdir(parents=True)
-        with open(str(openai_logdir/'args.txt'),'w') as f:
-            f.write( args.custom_reward + '/')
-            f.write( str(kwargs) )
+        run = wandb.init(
+            project="trex-training",
+            group=group,
+            config=config,
+            sync_tensorboard=True,  # auto-upload sb3's tensorboard metrics
+            monitor_gym=True,  # auto-upload the videos of agents playing the game
+            save_code=True,  # optional
+        )
+        wandb_callback = WandbCallback(
+                model_save_path=f"models/{run.id}",
+                verbose=2,
+            )
 
-        cmd = template.format(
-            env=args.env_id,
-            custom_reward=args.custom_reward,
-            gamma=args.gamma,
-            kwargs=str(kwargs))
-
-        procs = []
         for i in range(args.rl_runs):
-            env = os.environ.copy()
-            env["OPENAI_LOGDIR"] = str(openai_logdir/('run_%d'%i))
-            if i == 0:
-                env["OPENAI_LOG_FORMAT"] = 'stdout,log,csv,tensorboard'
-                p = subprocess.Popen(cmd, cwd='./learner/baselines', stdout=subprocess.PIPE, env=env, shell=True)
-            else:
-                env["OPENAI_LOG_FORMAT"] = 'log,csv,tensorboard'
-                p = subprocess.Popen(cmd, cwd='./learner/baselines', env=env, shell=True)
-            procs.append(p)
+            def make_indiv_env():
+                env = gym.make(config["env_id"])
+                env = TorchPreferenceRewardNormalized(env, args.num_models, args.log_dir, args.include_action, args.num_layers, args.embedding_dims)
+                return env
+            env = DummyVecEnv([make_indiv_env for _ in range(args.num_envs)])
+            model = PPO(config['policy_type'], env, n_steps=128//args.num_envs, device="cpu", tensorboard_log=f"runs/{run.id}")
 
-        for line in procs[0].stdout:
-            print(line.decode(),end='')
+            model.learn(
+                total_timesteps=config["total_timesteps"],
+                callback=[wandb_callback],
+            )
+            env.close()
 
-        for p in procs[1:]:
-            p.wait()
+            # Evaluate the trained model
+            eval_env = gym.make(config["env_id"])
+            max_xs = []
+            for k in range(30):
+                print(f'Evaluation Run {k}')
+                obs, _ = eval_env.reset()
+                total_reward = 0
+                num_steps = 0
+                done = False
+                terminated = False
+                max_x_pos = -np.inf
+                
+                while not done and not terminated and num_steps < 1000:
+                    action, _ = model.predict(obs)
+                    obs, reward, done, terminated, info = eval_env.step(action)
+                    total_reward += reward
+                    num_steps += 1
+                    max_x_pos = max(max_x_pos, info["x_position"])
+                        
+                run.log({
+                    "total_reward": total_reward,
+                    "total_steps": num_steps,
+                    "max_x_pos": max_x_pos
+                })
+                max_xs.append(max_x_pos)
+                print(f'Run {k} - Total Reward: {total_reward}, Total Steps: {num_steps}, Max X Pos: {max_x_pos}')
+            print(f'Average Max X Pos: {np.mean(max_xs)} STD Max X Pos: {np.std(max_xs)}')
+            eval_env.close()
 
+            run.finish()
     else:
         # eval(args)
 
