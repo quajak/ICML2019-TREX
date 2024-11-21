@@ -111,7 +111,7 @@ class TorchPreferenceReward(Wrapper):
         # Load models
         self.models = []
         for i in range(num_models):
-            model = Model(include_action, self.observation_space.shape[0], 
+            model = Model(i, include_action, self.observation_space.shape[0], 
                          self.action_space.shape[0], num_layers=num_layers,
                          embedding_dims=embedding_dims, device=self.device)
             model.load_state_dict(torch.load(f"{model_dir}/model_{i}.pt"))

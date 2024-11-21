@@ -3,11 +3,15 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from tqdm import tqdm
+import wandb
+
+from gt_traj_dataset import GTTrajLevelDataset
 
 class Model(nn.Module):
-    def __init__(self, include_action, ob_dim, ac_dim, batch_size=64, num_layers=2, 
+    def __init__(self, model_num: int, include_action, ob_dim, ac_dim, batch_size=64, num_layers=2, 
                  embedding_dims=256, device="cuda" if torch.cuda.is_available() else "cpu"):
         super(Model, self).__init__()
+        self.model_num = model_num
         self.include_action = include_action
         self.device = device
         in_dims = ob_dim + ac_dim if include_action else ob_dim
@@ -60,36 +64,40 @@ class Model(nn.Module):
         for param in self.parameters():
             l2_loss += torch.norm(param)
         loss += l2_reg * l2_loss
-        
-        return loss
+        acc = (logits.argmax(dim=1).squeeze() == labels).float().mean().item()
+        return loss, acc
 
-    def train_model(self, dataset, batch_size, num_epochs=10000, l2_reg=0.01, 
-                   noise_level=0.1, debug=False):
+    def do_step(self, dataset: GTTrajLevelDataset, batch_size: int, l2_reg: float, noise_level: float) -> tuple[torch.Tensor, float]:
+        # Get batch of trajectory pairs from dataset
+        D = dataset.sample(batch_size, include_action=self.include_action)
+        
+        # Convert samples to tensors
+        x = torch.FloatTensor(np.stack([x for x, _, _ in D])).to(self.device)
+        y = torch.FloatTensor(np.stack([y for _, y, _ in D])).to(self.device)
+        labels = torch.LongTensor([l for _, _, l in D]).to(self.device)
+        
+        # Add noise to labels
+        if noise_level > 0:
+            noise = torch.bernoulli(torch.full_like(labels.float(), noise_level))
+            labels = (labels + noise.long()) % 2
+        
+        return self.train_step(x, y, labels, l2_reg)
+
+    def train_model(self, dataset: GTTrajLevelDataset, val_dataset: GTTrajLevelDataset, batch_size: int, num_epochs: int = 10000, l2_reg: float = 0.01, 
+                   noise_level: float = 0.1, debug: bool = False, run = None):
         optimizer = optim.Adam(self.parameters(), lr=1e-4)
-        traj_trained_on = 0
         
         for epoch in tqdm(range(num_epochs)):
-            # Get batch of trajectory pairs from dataset
-            D = dataset.sample(batch_size, include_action=self.include_action)
-            traj_trained_on += len(D)
-            
-            # Convert samples to tensors
-            x = torch.FloatTensor(np.stack([x for x, _, _ in D])).to(self.device)
-            y = torch.FloatTensor(np.stack([y for _, y, _ in D])).to(self.device)
-            labels = torch.LongTensor([l for _, _, l in D]).to(self.device)
-            
-            # Add noise to labels
-            if noise_level > 0:
-                noise = torch.bernoulli(torch.full_like(labels.float(), noise_level))
-                labels = (labels + noise.long()) % 2
-            
             # Training step
             optimizer.zero_grad()
-            loss = self.train_step(x, y, labels, l2_reg)
+            loss, acc = self.do_step(dataset, batch_size, l2_reg, noise_level)
             loss.backward()
             optimizer.step()
-            
-            if debug and (epoch % 100 == 0 or epoch < 10):
-                tqdm.write(f'Step {epoch}, Loss: {loss.item():.4f}')
+            run.log({f"model_{self.model_num}/loss": loss.item(), f"model_{self.model_num}/step": epoch, f"model_{self.model_num}/acc": acc})
 
-        print(f'Trained on {traj_trained_on} trajectories')
+            if epoch % 100 == 0:
+                # Validation step
+                val_loss, val_acc = self.do_step(val_dataset, batch_size, l2_reg, noise_level)
+                run.log({f"model_{self.model_num}/val_loss": val_loss.item(), f"model_{self.model_num}/val_acc": val_acc})
+                if debug:
+                    tqdm.write(f"Epoch {epoch} - Loss: {loss.item()} - Val Loss: {val_loss.item()} - Acc: {acc} - Val Acc: {val_acc}")
