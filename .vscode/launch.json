@@ -5,12 +5,12 @@
     "version": "0.2.0",
     "configurations": [
         {
-            "name": "Python Debugger: Current File",
+            "name": "preference learning",
             "type": "debugpy",
             "request": "launch",
-            "program": "${file}",
+            "program": "${workspaceFolder}/mujoco/preference_learning.py",
             "console": "integratedTerminal",
-            "args": ["--env_id", "HalfCheetah-v4", "--log_dir", "trex_log", "--learners_path", "trex_models" ],
+            "args": ["--env_id", "can", "--robomimic", "--preference_type", "classifier", "--num_models", "1"],
             "cwd": "${workspaceFolder}/mujoco"
         }
     ]

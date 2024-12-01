@@ -7,10 +7,50 @@ import wandb
 import pickle
 
 class GTTrajLevelDataset(GTDataset):
-    def __init__(self,env, log_dir: str, val: bool = False):
-        super().__init__(env)
+    def __init__(self,env, log_dir: str,robomimic=False, val: bool = False):
+        super().__init__(env, robomimic)
         self.log_dir = log_dir
         self.val = val
+    
+    def gen_random_trajs(self, min_length: int):
+        random_traj_save_file = self.log_dir + f'/random_trajs{"_val" if self.val else ""}.npy'
+        if os.path.exists(random_traj_save_file):
+            with open(random_traj_save_file, 'rb') as f:
+                return pickle.load(f)
+
+        trajs = []
+        for _ in tqdm(range(100)):
+            first_obs = self.env.reset()
+            obs, actions, rewards = [first_obs], [], []
+            max_length = 200
+            while len(obs) < max_length:  # we collect 1000 steps of trajectory for each agent
+                action = self.env.action_space.sample()
+                ob, reward, done, info = self.env.step(action)
+                if len(action.shape) == 0:
+                    action = action[None]
+
+                done |= reward == 1
+
+                obs.append(ob)
+                actions.append(action)
+                rewards.append(reward)
+
+                if done:
+                    if len(obs) < min_length:
+                        obs.pop()
+                        ob, _= self.env.reset()
+                        obs.append(ob)
+                    else:
+                        obs.pop()
+                        break
+
+            obs = [np.concatenate([ob[k] for k in ['object', 'robot0_eef_pos', 'robot0_gripper_qpos', 'robot0_eef_quat']]) for ob in obs]
+            traj_data = (0, np.stack(obs, axis=0), np.concatenate(actions, axis=0), np.array(rewards), 0)
+            trajs.append(traj_data)
+        
+        with open(random_traj_save_file, 'wb') as f:
+            pickle.dump(trajs, f)
+        return trajs
 
     def prebuilt(self, agents: list[PPO], min_length: int, run):
         assert len(agents)>0, 'no agent is given'
@@ -18,6 +58,11 @@ class GTTrajLevelDataset(GTDataset):
         if os.path.exists(save_file):
             with open(save_file, 'rb') as f:
                 self.trajs = pickle.load(f)
+            print('total successful trajectories:', sum([traj[4] for traj in self.trajs]), 'out of', len(self.trajs))
+            
+            extra_trajs = self.gen_random_trajs(min_length)
+
+            self.trajs = self.trajs + extra_trajs
             self.sort_trajs()
             return
 

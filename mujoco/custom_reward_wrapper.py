@@ -101,20 +101,21 @@ class TorchRandomReward(Wrapper):
 
 class TorchPreferenceReward(Wrapper):
     def __init__(self, env, num_models, model_dir, include_action, num_layers, 
-                 embedding_dims, ctrl_coeff=0., alive_bonus=0.):
+                 embedding_dims, robomimic=False, convert_obs=True, ctrl_coeff=0., alive_bonus=0.):
         super().__init__(env)
         self.ctrl_coeff = ctrl_coeff
         self.alive_bonus = alive_bonus
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.last_action = None
-        
+        self.robomimic = robomimic
+        self.convert_obs = convert_obs
         # Load models
         self.models = []
         for i in range(num_models):
             model = Model(i, include_action, self.observation_space.shape[0], 
                          self.action_space.shape[0], num_layers=num_layers,
                          embedding_dims=embedding_dims, device=self.device)
-            model.load_state_dict(torch.load(f"{model_dir}/model_{i}.pt"))
+            model.load_state_dict(torch.load(f"{model_dir}/model_{i}.pt", weights_only=True))
             model.eval()
             self.models.append(model)
 
@@ -140,24 +141,41 @@ class TorchPreferenceReward(Wrapper):
     
     def reset(self, **kwargs):
         self.last_action = None
-        return self.env.reset(**kwargs)
+        if not self.robomimic:
+            return self.env.reset(**kwargs)
+        else:
+            x = self.env.reset()
+            if self.convert_obs:
+                return np.concatenate([x[k] for k in ['object', 'robot0_eef_pos', 'robot0_gripper_qpos', 'robot0_eef_quat']])
+            else:
+                return x
 
 class TorchPreferenceRewardNormalized(TorchPreferenceReward):
     def __init__(self, env, num_models, model_dir, include_action, num_layers, 
-                 embedding_dims, ctrl_coeff=0., alive_bonus=0.):
+                 embedding_dims, robomimic=False, convert_obs=True, ctrl_coeff=0., alive_bonus=0., cliprew=10.):
         super().__init__(env, num_models, model_dir, include_action, num_layers, 
-                        embedding_dims, ctrl_coeff, alive_bonus)
+                        embedding_dims, robomimic, convert_obs,ctrl_coeff, alive_bonus)
         
         self.rew_rms = [RunningMeanStd(shape=()) for _ in range(num_models)]
-        self.cliprew = 10.
+        self.cliprew = cliprew
         self.epsilon = 1e-8
         
     def step(self, action):
-        obs, reward, done, terminated, info = self.env.step(action)
+        if self.robomimic:
+            obs, reward, done, info = self.env.step(action)
+            done |= reward == 1
+            terminated = done
+            if self.convert_obs:
+                obs = np.concatenate([obs[k] for k in ['object', 'robot0_eef_pos', 'robot0_gripper_qpos', 'robot0_eef_quat']])
+        else:
+            obs, reward, done, terminated, info = self.env.step(action)
         self.last_action = action
         
         # Convert to tensors and add batch dimension
-        obs_tensor = torch.FloatTensor(obs).unsqueeze(0).to(self.device)
+        if self.convert_obs:
+            obs_tensor = torch.FloatTensor(obs).unsqueeze(0).to(self.device)
+        else:
+            obs_tensor = torch.FloatTensor(np.concatenate([obs[k] for k in ['object', 'robot0_eef_pos', 'robot0_gripper_qpos', 'robot0_eef_quat']])).unsqueeze(0).to(self.device)
         action_tensor = torch.FloatTensor(action).unsqueeze(0).to(self.device)
         
         # Compute normalized rewards from all models
@@ -175,3 +193,6 @@ class TorchPreferenceRewardNormalized(TorchPreferenceReward):
                  self.alive_bonus)
         
         return obs, reward, done, terminated, info
+
+    def render(self, mode="human", height=256, width=256):
+        return self.env.render(mode=mode, height=height, width=width)

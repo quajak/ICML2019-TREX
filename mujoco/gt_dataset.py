@@ -3,8 +3,9 @@ from tqdm import tqdm
 from stable_baselines3 import PPO
 
 class GTDataset:
-    def __init__(self,env):
+    def __init__(self,env, robomimic=False):
         self.env = env
+        self.robomimic = robomimic
         self.unwrapped = env
         while hasattr(self.unwrapped,'env'):
             self.unwrapped = self.unwrapped.env
@@ -12,15 +13,31 @@ class GTDataset:
     def gen_traj(self, agent: PPO, min_length: int):
         max_x_pos = -99999
 
-        first_obs, _ = self.env.reset()
+        if self.robomimic:
+            first_obs = self.env.reset()
+        else:
+            first_obs, _ = self.env.reset()
         obs, actions, rewards = [first_obs], [], []
-        while len(obs) < 1000:  # we collect 1000 steps of trajectory for each agent
-            action, _ = agent.predict(obs[-1], None, None)
-            ob, reward, done, _, info = self.env.step(action)
+        max_length = 1000 if not self.robomimic else 200
+        while len(obs) < max_length:  # we collect 1000 steps of trajectory for each agent
+            if self.robomimic:
+                action = agent(obs[-1])
+            else:
+                action, _ = agent.predict(obs[-1], None, None)
+            if self.robomimic:
+                ob, reward, done, info = self.env.step(action)
+            else:
+                ob, reward, done, _, info = self.env.step(action)
             if len(action.shape) == 0:
                 action = action[None]
-            if info['x_position'] > max_x_pos:
-                max_x_pos = info['x_position']
+            if self.robomimic:
+                max_x_pos = max(max_x_pos, reward)
+            else:   
+                if info['x_position'] > max_x_pos:
+                    max_x_pos = info['x_position']
+
+            if self.robomimic:
+                done |= reward == 1
 
             obs.append(ob)
             actions.append(action)
@@ -35,6 +52,7 @@ class GTDataset:
                     obs.pop()
                     break
 
+        obs = [np.concatenate([ob[k] for k in ['object', 'robot0_eef_pos', 'robot0_gripper_qpos', 'robot0_eef_quat']]) for ob in obs]
         return (np.stack(obs, axis=0), np.concatenate(actions, axis=0), np.array(rewards)), max_x_pos
 
     def prebuilt(self,agents,min_length):

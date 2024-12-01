@@ -5,3 +5,6 @@ mujoco/trex_models
 mujoco/trex_runs
 mujoco/wandb
 mujoco/trex_log
+./.vscode
+wandb/
+mujoco/robomimic/

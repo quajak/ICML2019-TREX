@@ -93,11 +93,13 @@ class Model(nn.Module):
             loss, acc = self.do_step(dataset, batch_size, l2_reg, noise_level)
             loss.backward()
             optimizer.step()
-            run.log({f"model_{self.model_num}/loss": loss.item(), f"model_{self.model_num}/step": epoch, f"model_{self.model_num}/acc": acc})
+            step_info = {f"model_{self.model_num}/loss": loss.item(), f"model_{self.model_num}/step": epoch, f"model_{self.model_num}/acc": acc}
 
             if epoch % 100 == 0:
                 # Validation step
                 val_loss, val_acc = self.do_step(val_dataset, batch_size, l2_reg, noise_level)
-                run.log({f"model_{self.model_num}/val_loss": val_loss.item(), f"model_{self.model_num}/val_acc": val_acc})
+                val_info = {f"model_{self.model_num}/val_loss": val_loss.item(), f"model_{self.model_num}/val_acc": val_acc}
+                step_info.update(val_info)
                 if debug:
                     tqdm.write(f"Epoch {epoch} - Loss: {loss.item()} - Val Loss: {val_loss.item()} - Acc: {acc} - Val Acc: {val_acc}")
+            run.log(step_info)
