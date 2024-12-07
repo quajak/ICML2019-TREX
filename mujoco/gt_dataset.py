@@ -53,7 +53,7 @@ class GTDataset:
                     break
 
         obs = [np.concatenate([ob[k] for k in ['object', 'robot0_eef_pos', 'robot0_gripper_qpos', 'robot0_eef_quat']]) for ob in obs]
-        return (np.stack(obs, axis=0), np.concatenate(actions, axis=0), np.array(rewards)), max_x_pos
+        return (np.stack(obs, axis=0), np.concatenate(actions, axis=0).reshape(-1, 7), np.array(rewards)), max_x_pos
 
     def prebuilt(self,agents,min_length):
         assert len(agents)>0, 'no agent given'

@@ -9,22 +9,24 @@ if TYPE_CHECKING:
     from gt_traj_dataset import GTTrajDataset
 
 class Classifier(nn.Module):
-    def __init__(self, robomimic=False, device="cuda" if torch.cuda.is_available() else "cpu"):
+    def __init__(self, env_name, robomimic=False, include_action=False, device="cuda" if torch.cuda.is_available() else "cpu"):
         super(Classifier, self).__init__()
         self.num_timesteps = 1
-        self.num_features = 23 if robomimic else 17
+        self.include_action = include_action
+        feature_map = {
+            'can': 23,
+            'lift': 19
+        }
+        self.num_features = feature_map[env_name]
+        self.num_actions = 7 if robomimic else 3
         self.device = device
         self.robomimic = robomimic
         
         self.model = nn.Sequential(
-            nn.Linear(self.num_timesteps * self.num_features, 256),
+            nn.Linear(self.num_timesteps * self.num_features + (self.num_actions if self.include_action else 0), 128),
             nn.ReLU(),
-            nn.Linear(256, 256),
-            nn.Dropout(0.2),
-            nn.ReLU(),
-            nn.Linear(256, 128),
-            nn.Dropout(0.2),
-            nn.ReLU(),
+            # nn.Linear(128, 64),
+            # nn.ReLU(),
             nn.Linear(128, 2)
         ).to(device)
 
@@ -41,7 +43,7 @@ class Classifier(nn.Module):
     def train_classifier(self, dataset: 'GTTrajDataset', val_dataset: 'GTTrajDataset'):
         config = {
             "batch_size": 64,
-            "epochs": 300 if self.robomimic else 20,
+            "epochs": 900 if self.robomimic else 20,
         }
         train_trajectories = dataset.trajs
         val_trajectories = val_dataset.trajs
@@ -60,7 +62,10 @@ class Classifier(nn.Module):
                 for traj in selected_trajectories:
                     full_states = traj[1]  # States from trajectory
                     pos = np.random.randint(0, len(full_states) - self.num_timesteps)
-                    x.append(full_states[pos:pos+self.num_timesteps])
+                    if self.include_action:
+                        x.append(np.concatenate([full_states[pos:pos+self.num_timesteps], traj[2].reshape(-1, self.num_actions)[pos+self.num_timesteps - 1][None, :]], axis=1))
+                    else:
+                        x.append(full_states[pos:pos+self.num_timesteps])
                     if self.robomimic:
                         y.append(traj[4])
                     else:
@@ -84,7 +89,10 @@ class Classifier(nn.Module):
                 for traj in val_trajectories:
                     full_states = traj[1]
                     pos = np.random.randint(0, len(full_states) - self.num_timesteps)
-                    val_x.append(full_states[pos:pos+self.num_timesteps])
+                    if self.include_action:
+                        val_x.append(np.concatenate([full_states[pos:pos+self.num_timesteps], traj[2].reshape(-1, self.num_actions)[pos+self.num_timesteps - 1][None, :]], axis=1))
+                    else:
+                        val_x.append(full_states[pos:pos+self.num_timesteps])
                     if self.robomimic:
                         val_y.append(traj[4])
                     else:

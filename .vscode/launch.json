@@ -10,7 +10,7 @@
             "request": "launch",
             "program": "${workspaceFolder}/mujoco/preference_learning.py",
             "console": "integratedTerminal",
-            "args": ["--env_id", "can", "--robomimic", "--preference_type", "classifier", "--num_models", "1"],
+            "args": ["--env_id", "lift", "--robomimic", "--preference_type", "classifier", "--num_models", "1", "--include_action"],
             "cwd": "${workspaceFolder}/mujoco"
         }
     ]

@@ -7,7 +7,7 @@ import wandb
 import pickle
 
 class GTTrajLevelDataset(GTDataset):
-    def __init__(self,env, log_dir: str,robomimic=False, val: bool = False):
+    def __init__(self,env, log_dir: str, robomimic=False, val: bool = False):
         super().__init__(env, robomimic)
         self.log_dir = log_dir
         self.val = val

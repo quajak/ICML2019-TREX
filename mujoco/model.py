@@ -85,7 +85,7 @@ class Model(nn.Module):
 
     def train_model(self, dataset: GTTrajLevelDataset, val_dataset: GTTrajLevelDataset, batch_size: int, num_epochs: int = 10000, l2_reg: float = 0.01, 
                    noise_level: float = 0.1, debug: bool = False, run = None):
-        optimizer = optim.Adam(self.parameters(), lr=1e-4)
+        optimizer = optim.Adam(self.parameters(), lr=5e-5)
         
         for epoch in tqdm(range(num_epochs)):
             # Training step
