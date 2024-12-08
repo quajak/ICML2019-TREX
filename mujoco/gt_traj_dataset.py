@@ -11,6 +11,7 @@ class GTTrajLevelDataset(GTDataset):
         super().__init__(env, robomimic)
         self.log_dir = log_dir
         self.val = val
+        self.trajs = []
     
     def gen_random_trajs(self, min_length: int):
         random_traj_save_file = self.log_dir + f'/random_trajs{"_val" if self.val else ""}.npy'
@@ -123,3 +124,15 @@ class GTTrajLevelDataset(GTDataset):
         # print('------------------')
 
         return D
+
+    def add_trajectory(self, obs, actions, rewards, max_x=0):
+        """Add a new trajectory to the dataset"""
+        agent_idx = len(self.trajs)  # Use length as new agent index
+        traj_data = (agent_idx, np.stack(obs, axis=0), np.array(actions), np.array(rewards), max_x)
+        self.trajs.append(traj_data)
+        self.sort_trajs()  # Re-sort after adding new trajectory
+        
+        # # Save updated dataset
+        # save_file = self.log_dir + f'/trajs{"_val" if self.val else ""}.npy'
+        # with open(save_file, 'wb') as f:
+        #     pickle.dump(self.trajs, f)

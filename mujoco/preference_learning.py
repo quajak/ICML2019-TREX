@@ -9,7 +9,7 @@ import gymnasium as gym
 from tqdm import tqdm
 import matplotlib
 import wandb
-from stable_baselines3 import PPO
+from stable_baselines3 import TD3
 from stable_baselines3.common.vec_env import DummyVecEnv
 import time
 from wandb.integration.sb3 import WandbCallback
@@ -52,7 +52,7 @@ def train(args: dict, run):
         if args.robomimic:
             agent, ckpt_dict = FileUtils.policy_from_checkpoint(ckpt_path=path, device=device, verbose=False)
         else:
-            agent = PPO.load(path, device='cpu')
+            agent = TD3.load(path, device='cpu')
             setattr(agent, 'model_path', str(path))
         train_agents.append(agent)
 
@@ -73,159 +73,79 @@ def train(args: dict, run):
         val_dataset = GTTrajLevelDataset(env, args.log_dir, val=True, robomimic=args.robomimic)
         dataset.prebuilt(train_agents, args.min_length, run)
         val_dataset.prebuilt(train_agents, args.min_length, run)
-    elif args.preference_type == 'classifier':
+    if args.preference_type == 'classifier':
         print("Initializing classifier-based training...")
         
         # First create and train the classifier on all data
-        base_dataset = GTTrajLevelDataset(env=env, log_dir=args.log_dir, robomimic=args.robomimic)
-        base_dataset.prebuilt(train_agents, args.min_length, run)
-        base_val_dataset = GTTrajLevelDataset(env, args.log_dir, val=True, robomimic=args.robomimic)
-        base_val_dataset.prebuilt(train_agents, args.min_length, run)
-        
-        print("Training classifier...")
-        classifier = Classifier(args.env_id, robomimic=args.robomimic, include_action=args.include_action, device=device)
-        classifier.train_classifier(base_dataset, base_val_dataset)
-        
-        # Save the trained classifier
-        torch.save(classifier.state_dict(), f"{args.log_dir}/classifier.pt")
-        
-        # Now create datasets using the trained classifier
-        print("Building classifier-based training dataset...")
-        dataset = ClassifierTrajDataset(env, args.log_dir, classifier)
-        start_time = time.time()
+        dataset = GTTrajLevelDataset(env=env, log_dir=args.log_dir, robomimic=args.robomimic)
         dataset.prebuilt(train_agents, args.min_length, run)
-        print(f"Training dataset built in {time.time() - start_time:.2f} seconds")
-
-        print("Building classifier-based validation dataset...")
-        val_dataset = ClassifierTrajDataset(env, args.log_dir, classifier, val=True)
-        start_time = time.time()
+        val_dataset = GTTrajLevelDataset(env, args.log_dir, val=True, robomimic=args.robomimic)
         val_dataset.prebuilt(train_agents, args.min_length, run)
-        print(f"Validation dataset built in {time.time() - start_time:.2f} seconds")
-    else:
-        raise ValueError('Invalid preference type')
-
-    # Initialize models
-    print("Initializing reward models...")
-    models = []
-    for i in range(args.num_models):
-        model = Model(
-            model_num=i,
-            include_action=args.include_action,
-            ob_dim=env.observation_space.shape[0],
-            ac_dim=env.action_space.shape[0],
-            num_layers=args.num_layers,
-            embedding_dims=args.embedding_dims,
-            device=device
-        )
-        models.append(model)
-
-    # Train each model
-    for i, model in enumerate(models):
-        print(f"Training reward model {i+1}/{args.num_models}")
-        
-        model.train_model(
-            dataset,
-            val_dataset,
-            batch_size=args.batch_size,
-            num_epochs=args.iter,
-            l2_reg=args.l2_reg,
-            noise_level=args.noise,
-            debug=True,
-            run=run
-        )
-
-        # Save model
-        torch.save(model.state_dict(), f"{args.log_dir}/model_{i}.pt")
-        # Save model configuration separately for loading
-        model_config = {
-            'include_action': args.include_action,
-            'ob_dim': env.observation_space.shape[0],
-            'ac_dim': env.action_space.shape[0],
-            'num_layers': args.num_layers,
-            'embedding_dims': args.embedding_dims
-        }
-        torch.save(model_config, f"{args.log_dir}/model_{i}_config.pt")
-
-        
-    # Visualize the classifier and learned reward models
-    print("Visualizing classifier and reward models...")
     
-    # Create environment for visualization
-    if args.robomimic:
-        vis_env, _ = FileUtils.env_from_checkpoint(
-            ckpt_dict=ckpt_dict, 
-            render=True,
-            render_offscreen=True,
-            verbose=False
-        )
-    else:
-        vis_env = gym.make(config['final_agent']['env_id'], render_mode='rgb_array')
-    
-    # Wrap environment to get reward predictions
-    vis_env = TorchPreferenceRewardNormalized(
-        vis_env,
-        args.num_models,
-        args.log_dir,
-        args.include_action,
-        args.num_layers,
-        args.embedding_dims,
-        robomimic=args.robomimic,
-        convert_obs=False
-    )
-
-    # Do a rollout and collect frames
-    for i in range(5):
-        frames = []
-        for _ in range(randint(1, 5)):
-            obs = vis_env.reset()
-        last_obs = np.concatenate([obs[k] for k in ['object', 'robot0_eef_pos', 'robot0_gripper_qpos', 'robot0_eef_quat']])
-        done = False
+    # Training loop iterations
+    for iteration in range(args.num_iterations):
+        print(f"\nStarting iteration {iteration + 1}/{args.num_iterations}")
         
-        while not done:
-            action = train_agents[0](obs)
-            obs, reward, done, terminated, info = vis_env.step(action)
-            frame = vis_env.render(mode="rgb_array")
-            img = Image.fromarray(frame)
-            draw = ImageDraw.Draw(img)
-            y = 10
-            if args.preference_type == 'classifier':
-                if args.robomimic:
-                    obs_pt = np.concatenate([obs[k] for k in ['object', 'robot0_eef_pos', 'robot0_gripper_qpos', 'robot0_eef_quat']])
-                else:
-                    obs_pt = obs
-                
-                if args.include_action:
-                    obs_pt = np.concatenate([obs_pt, action])
-                classifier_pred = classifier.forward(torch.from_numpy(obs_pt[None, :]).cuda().float())
-                classifier_pred = torch.softmax(classifier_pred, dim=1)[:, 1]
-                draw.text((10, y), f"Classifier: {classifier_pred.item():.3f}", fill=(255,255,255))
-            y += 20
-            draw.text((10, y), f"Reward: {reward.item():.3f}", fill=(255,255,255))
-            y += 20
+        if args.preference_type == 'classifier':
+            print("Training classifier...")
+            classifier = Classifier(args.env_id, robomimic=args.robomimic, include_action=args.include_action, device=device)
+            classifier.train_classifier(dataset, val_dataset)
+            torch.save(classifier.state_dict(), f"{args.log_dir}/classifier_iter_{iteration}.pt")
+            
+            # Update datasets with classifier
+            classifier_dataset = ClassifierTrajDataset(dataset, classifier)
+            classifier_val_dataset = ClassifierTrajDataset(val_dataset, classifier)
+            
+            # Use classifier datasets for training reward models
+            training_dataset = classifier_dataset
+            validation_dataset = classifier_val_dataset
+        else:
+            # Use original datasets for non-classifier training
+            training_dataset = dataset
+            validation_dataset = val_dataset
 
-            last_obs = obs_pt
-            frames.append(np.array(img))
-    
-        # Save video
-        imageio.mimsave(f"{args.log_dir}/rollout_vis_{i}.mp4", frames, fps=30)
-        print(f"Saved visualization video to {args.log_dir}/rollout_vis_{i}.mp4")
+        # Train reward models
+        print("Training reward models...")
+        models = []
+        for i in range(args.num_models):
+            model = Model(
+                model_num=i,
+                include_action=args.include_action,
+                ob_dim=env.observation_space.shape[0],
+                ac_dim=env.action_space.shape[0],
+                num_layers=args.num_layers,
+                embedding_dims=args.embedding_dims,
+                device=device
+            )
+            model.train_model(training_dataset, validation_dataset, batch_size=args.batch_size,
+                            num_epochs=args.iter, l2_reg=args.l2_reg,
+                            noise_level=args.noise, debug=True, run=run)
+            models.append(model)
+            torch.save(model.state_dict(), f"{args.log_dir}/model_{i}_iter_{iteration}.pt")
+
+        # Train TD3 agent
+        print("Training PPO agent...")
+        all_trajectories = train_td3_agent(args, models, env, run, iteration, ckpt_dict, classifier)
+        # Add all trajectories to dataset
+        for traj in all_trajectories:
+            dataset.add_trajectory(traj[0], traj[1], traj[2])
+
+            
+        print(f"Dataset size after iteration {iteration + 1}: {len(dataset.trajs)}")
         
-    vis_env.close()
+    print("Training completed!")
 
-    print("Training PPO agent with learned reward models...")
-    # Train an agent
-    group = str(time.time())
-
+def train_td3_agent(args, models, env, run, iteration, ckpt_dict, classifier):
+    print("Training TD3 agent with learned reward models...")
     wandb_callback = WandbCallback(
-            model_save_path=f"models/{run.id}",
-            verbose=2,
-        )
+        model_save_path=f"models/{run.id}",
+        verbose=2,
+    )
 
     agent_config = config['final_agent']
     for i in range(args.rl_runs):
         def make_indiv_env():
             if args.robomimic:
-                # Load robomimic env using same structure as earlier
                 env, _ = FileUtils.env_from_checkpoint(
                     ckpt_dict=ckpt_dict,
                     render=False,
@@ -233,21 +153,22 @@ def train(args: dict, run):
                     verbose=False,
                 )
             else:
-                # Regular gym/mujoco env
                 env = gym.make(agent_config["env_id"])
             
             env = TorchPreferenceRewardNormalized(env, args.num_models, args.log_dir, args.include_action, args.num_layers, args.embedding_dims, robomimic=args.robomimic, cliprew=args.cliprew)
             return env
 
         env = DummyVecEnv([make_indiv_env for _ in range(args.num_envs)], args.robomimic)
-        model = PPO(
-            agent_config['policy_type'], 
-            env, 
+        model = TD3(
+            agent_config['policy_type'],
+            env,
             learning_rate=3e-4,
-            n_steps=128 // args.num_envs,  # this was 128//4 for mujoco
-            batch_size=128,  # added for robomimic
-            clip_range=0.2,
-            device="cpu", 
+            buffer_size=1000000,  # Replay buffer size
+            learning_starts=100,  # How many steps before starting training
+            batch_size=256,
+            tau=0.005,  # Target network update rate
+            policy_delay=2,  # Delay policy updates
+            device="cpu",
             tensorboard_log=f"runs/{run.id}",
             verbose=0
         )
@@ -256,10 +177,9 @@ def train(args: dict, run):
             total_timesteps=agent_config["total_timesteps"],
             callback=[
                 wandb_callback,
-                # Add evaluation callback to monitor performance during training
                 EvalCallback(
                     eval_env=make_indiv_env(),
-                    eval_freq=5000,  # Evaluate every 10000 steps
+                    eval_freq=5000,
                     n_eval_episodes=10,
                     best_model_save_path=f"{args.log_dir}/{run.id}/best_model",
                     log_path=f"{args.log_dir}/{run.id}",
@@ -269,91 +189,80 @@ def train(args: dict, run):
         )
         env.close()
 
-        # Evaluate the trained model
-        if args.robomimic:
-            eval_env, _ = FileUtils.env_from_checkpoint(
-                ckpt_dict=ckpt_dict,
-                render=True,
-                render_offscreen=True,
-                verbose=False,
-            )
+    # Evaluate the trained model
+    if args.robomimic:
+        eval_env, _ = FileUtils.env_from_checkpoint(
+            ckpt_dict=ckpt_dict,
+            render=True,
+            render_offscreen=True,
+            verbose=False,
+        )
 
-            eval_env = TorchPreferenceRewardNormalized(eval_env, args.num_models, args.log_dir, args.include_action, args.num_layers, args.embedding_dims, robomimic=args.robomimic, cliprew=args.cliprew)
-        else:
-            eval_env = gym.make(agent_config["env_id"])
+        eval_env = TorchPreferenceRewardNormalized(eval_env, args.num_models, args.log_dir, args.include_action, args.num_layers, args.embedding_dims, robomimic=args.robomimic, cliprew=args.cliprew)
+    else:
+        eval_env = gym.make(agent_config["env_id"])
 
-        max_xs = []
-        for k in range(30):
-            print(f'Evaluation Run {k}')
-            if args.robomimic:
-                for i in range(randint(2, 5)):
-                    obs = eval_env.reset()  # to ensure random start seed
-                    # obs = np.concatenate([obs[k] for k in ['object', 'robot0_eef_pos', 'robot0_gripper_qpos', 'robot0_eef_quat']])
-            else:
-                obs, _ = eval_env.reset()
-            total_reward = 0
-            num_steps = 0
-            done = False
-            terminated = False
-            max_x_pos = -np.inf
-            last_obs = obs
-            frames = []
+    # Track all trajectories during evaluation
+    all_trajectories = []
+    
+    # During evaluation, store trajectories that exceed the reward threshold
+    for eval_ep in range(10):  # TODO: Used to be 30
+        obs = eval_env.reset()
+        trajectory_obs = []
+        trajectory_actions = []
+        trajectory_rewards = []
+        total_reward = 0
+        frames = []
+        done = False
+        terminated = False
+        while not done and not terminated:
+            action, _ = model.predict(obs)
+            next_obs, reward, done, terminated, info = eval_env.step(action)
             
-            while not done and not terminated and num_steps < 500:  # 1000 for mujoco
-                action, _ = model.predict(obs)
-                next_obs, reward, done, terminated, info = eval_env.step(action)
-                
-                # Get classifier prediction if available
-                pred_text = ""
-                if args.preference_type == 'classifier':
-                    with torch.no_grad():
-                        if args.include_action:
-                            obs_tensor = torch.FloatTensor(np.concatenate([next_obs, action])).unsqueeze(0).to(classifier.device)
-                        else:
-                            obs_tensor = torch.FloatTensor(np.concatenate([next_obs])).unsqueeze(0).to(classifier.device)
-                        pred = classifier(obs_tensor)
-                        pred = torch.softmax(pred, dim=1)[0,1].item()
-                        pred_text = f"Classifier Score: {pred:.3f}"
-                
-                last_obs = next_obs
-                # Render frame and add text
-                frame = eval_env.render(mode='rgb_array', width=256, height=256)
-                if pred_text:
-                    # Convert frame to PIL Image
-                    frame_pil = Image.fromarray(frame)
-                    draw = ImageDraw.Draw(frame_pil)
-                    draw.text((10, 10), pred_text, fill=(255, 255, 255))
-                    draw.text((10, 30), f"Reward: {reward.item():.3f}", fill=(255, 255, 255))
-                    frame = np.array(frame_pil)
-                
+            trajectory_obs.append(obs)
+            trajectory_actions.append(action)
+            trajectory_rewards.append(reward)
+            total_reward += reward
+
+            # Get classifier prediction if available
+            pred_text = ""
+            if args.preference_type == 'classifier':
+                with torch.no_grad():
+                    if args.include_action:
+                        obs_tensor = torch.FloatTensor(np.concatenate([next_obs, action])).unsqueeze(0).to(classifier.device)
+                    else:
+                        obs_tensor = torch.FloatTensor(np.concatenate([next_obs])).unsqueeze(0).to(classifier.device)
+                    pred = classifier(obs_tensor)
+                    pred = torch.softmax(pred, dim=1)[0,1].item()
+                    pred_text = f"Classifier Score: {pred:.3f}"
+            
+            # Render frame and add text
+            frame = eval_env.render(mode='rgb_array', width=256, height=256)
+            if pred_text:
+                # Convert frame to PIL Image
+                frame_pil = Image.fromarray(frame)
+                draw = ImageDraw.Draw(frame_pil)
+                draw.text((10, 10), pred_text, fill=(255, 255, 255))
+                draw.text((10, 30), f"Reward: {reward.item():.3f}", fill=(255, 255, 255))
+                frame = np.array(frame_pil)
+            
                 frames.append(frame)
-                
-                obs = next_obs
-                total_reward += reward if not isinstance(reward, np.ndarray) else reward.item()
-                num_steps += 1
-                if not args.robomimic:  # Only track x_position for mujoco envs
-                    max_x_pos = max(max_x_pos, info["x_position"])
             
-            # Save video using imageio
-            os.makedirs(f"{args.log_dir}/{run.id}/videos", exist_ok=True)
-            video_path = f"{args.log_dir}/{run.id}/videos/run_{k}.mp4"
-            imageio.mimsave(video_path, frames, fps=10)
-            print(f"Saved video to {video_path}")
+            obs = next_obs
+            
+        # Save video using imageio
+        os.makedirs(f"{args.log_dir}/{run.id}/videos", exist_ok=True)
+        video_path = f"{args.log_dir}/{run.id}/videos/run_{eval_ep}.mp4"
+        imageio.mimsave(video_path, frames, fps=10)
+        print(f"Saved video to {video_path}")
 
-            run.log({
-                "eval/total_reward": total_reward,
-                "eval/total_steps": num_steps,
-                "eval/max_x_pos": max_x_pos if not args.robomimic else 0,
-                "eval/run": k
-            })
-            max_xs.append(max_x_pos if not args.robomimic else 0)
-            print(f'Run {k} - Total Reward: {total_reward}, Total Steps: {num_steps}, Max X Pos: {max_x_pos if not args.robomimic else "N/A"}')
-        
-        if not args.robomimic:
-            print(f'Average Max X Pos: {np.mean(max_xs)} STD Max X Pos: {np.std(max_xs)}')
-        eval_env.close()
-
-        run.finish()
+        all_trajectories.append((
+            trajectory_obs,
+            trajectory_actions,
+            trajectory_rewards
+            ))
+    
+    return all_trajectories
 
 if __name__ == "__main__":
     # Required Args (target envs & learners)
@@ -387,16 +296,24 @@ if __name__ == "__main__":
     parser.add_argument('--gamma', default=0.99, type=float)
     parser.add_argument('--ppo_policy', default="MlpPolicy", type=str)
     parser.add_argument('--batch_size', default=512, type=int)  # 256 for mujoco from paper section 5.1.2
-    parser.add_argument('--iter', default=5000, type=int)  # how long to train the reward model - 5000 for mujoco
+    parser.add_argument('--iter', default=2000, type=int)  # how long to train the reward model - 5000 for mujoco and best performance on robomimic 
     parser.add_argument('--num_envs', default=4, type=int)
     parser.add_argument('--cliprew', default=10.0, type=float)
+    parser.add_argument('--num_iterations', default=3, type=int, help='number of training iterations')
+    parser.add_argument('--reward_threshold', default=1, type=float, help='reward threshold for adding trajectories to dataset')
     args = parser.parse_args()
 
     config = {
         "final_agent": {
             "policy_type": "MlpPolicy",
-            "total_timesteps": 100_000,
+            "total_timesteps": 50_000,
             "env_id": args.env_id,
+            # TD3-specific parameters
+            "learning_rate": 3e-4,
+            "buffer_size": 1000000,
+            "batch_size": 256,
+            "tau": 0.005,
+            "policy_delay": 2
         }
     }
     run = wandb.init(
