@@ -44,11 +44,12 @@ class Classifier(nn.Module):
         config = {
             "batch_size": 64,
             "epochs": 900 if self.robomimic else 20,
+            "weight_decay": 1e-4
         }
         train_trajectories = dataset.trajs
         val_trajectories = val_dataset.trajs
         
-        optimizer = torch.optim.Adam(self.parameters(), lr=5e-4)
+        optimizer = torch.optim.Adam(self.parameters(), lr=5e-4, weight_decay=config['weight_decay'])
         criterion = nn.CrossEntropyLoss()
 
         steps_per_epoch = 2 * len(train_trajectories) // config['batch_size']

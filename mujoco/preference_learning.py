@@ -9,11 +9,11 @@ import gymnasium as gym
 from tqdm import tqdm
 import matplotlib
 import wandb
-from stable_baselines3 import TD3
+from stable_baselines3 import PPO, TD3
 from stable_baselines3.common.vec_env import DummyVecEnv
 import time
 from wandb.integration.sb3 import WandbCallback
-from stable_baselines3.common.callbacks import EvalCallback
+from stable_baselines3.common.callbacks import EvalCallback, BaseCallback
 from PIL import Image, ImageDraw
 import imageio
 import cv2
@@ -25,6 +25,14 @@ from custom_reward_wrapper import TorchPreferenceRewardNormalized
 from gt_traj_dataset import GTTrajLevelDataset
 from classifier import Classifier
 from classifier_traj_dataset import ClassifierTrajDataset
+
+def get_agent(path, algorithm, device='cpu'):
+    if algorithm == 'PPO':
+        agent = PPO.load(path, device=device)
+    else:  # TD3
+        agent = TD3.load(path, device=device)
+    setattr(agent, 'model_path', str(path))
+    return agent
 
 def train(args: dict, run):
     logdir = Path(args.log_dir)
@@ -52,12 +60,11 @@ def train(args: dict, run):
         if args.robomimic:
             agent, ckpt_dict = FileUtils.policy_from_checkpoint(ckpt_path=path, device=device, verbose=False)
         else:
-            agent = TD3.load(path, device='cpu')
-            setattr(agent, 'model_path', str(path))
+            agent = get_agent(path, args.algorithm, device)
         train_agents.append(agent)
 
     if args.robomimic:
-        train_agents = train_agents * 300
+        train_agents = train_agents * 100
         env, _ = FileUtils.env_from_checkpoint(
             ckpt_dict=ckpt_dict, 
             render=False, 
@@ -124,8 +131,8 @@ def train(args: dict, run):
             torch.save(model.state_dict(), f"{args.log_dir}/model_{i}_iter_{iteration}.pt")
 
         # Train TD3 agent
-        print("Training PPO agent...")
-        all_trajectories = train_td3_agent(args, models, env, run, iteration, ckpt_dict, classifier)
+        print("Training agent...")
+        all_trajectories = train_rl_agent(args, models, env, run, iteration, ckpt_dict, classifier)
         # Add all trajectories to dataset
         for traj in all_trajectories:
             dataset.add_trajectory(traj[0], traj[1], traj[2])
@@ -135,8 +142,8 @@ def train(args: dict, run):
         
     print("Training completed!")
 
-def train_td3_agent(args, models, env, run, iteration, ckpt_dict, classifier):
-    print("Training TD3 agent with learned reward models...")
+def train_rl_agent(args, models, env, run, iteration, ckpt_dict, classifier):
+    print(f"Training {args.algorithm} agent with learned reward models...")
     wandb_callback = WandbCallback(
         model_save_path=f"models/{run.id}",
         verbose=2,
@@ -159,20 +166,36 @@ def train_td3_agent(args, models, env, run, iteration, ckpt_dict, classifier):
             return env
 
         env = DummyVecEnv([make_indiv_env for _ in range(args.num_envs)], args.robomimic)
-        model = TD3(
-            agent_config['policy_type'],
-            env,
-            learning_rate=3e-4,
-            buffer_size=1000000,  # Replay buffer size
-            learning_starts=100,  # How many steps before starting training
-            batch_size=256,
-            tau=0.005,  # Target network update rate
-            policy_delay=2,  # Delay policy updates
-            device="cpu",
-            tensorboard_log=f"runs/{run.id}",
-            verbose=0
-        )
+        
+        # Common parameters for both algorithms
+        common_params = {
+            'policy': agent_config['policy_type'],
+            'env': env,
+            'learning_rate': agent_config['learning_rate'],
+            'device': agent_config['device'],
+            'tensorboard_log': f"runs/{run.id}",
+            'verbose': 0
+        }
+        
+        model = build_rl_model(args, agent_config, common_params)
 
+        best_model = None
+        best_model_length = 10000
+
+        class SaveShortestModelCallback(BaseCallback):
+            def __init__(self, verbose=0):
+                super(SaveShortestModelCallback, self).__init__(verbose)
+                self.best_model = None
+                
+            def _on_step(self) -> bool:
+                nonlocal best_model, best_model_length
+                if np.mean(self.parent.evaluations_length) <= best_model_length:
+                    best_model_length = np.mean(self.parent.evaluations_length)
+                    self.model.save(f"{args.log_dir}/{run.id}/best_model/model_{iteration}.zip")
+                    best_model = build_rl_model(args, agent_config, common_params)
+                    best_model.load(f"{args.log_dir}/{run.id}/best_model/model_{iteration}.zip")
+                return True
+            
         model.learn(
             total_timesteps=agent_config["total_timesteps"],
             callback=[
@@ -183,13 +206,17 @@ def train_td3_agent(args, models, env, run, iteration, ckpt_dict, classifier):
                     n_eval_episodes=10,
                     best_model_save_path=f"{args.log_dir}/{run.id}/best_model",
                     log_path=f"{args.log_dir}/{run.id}",
-                    deterministic=True
+                    deterministic=False,
+                    callback_after_eval=SaveShortestModelCallback()
                 )
             ],
         )
         env.close()
 
-    # Evaluate the trained model
+    # Evaluate the the model
+    print("Evaluating model with best model length: ", best_model_length)
+    model = best_model
+
     if args.robomimic:
         eval_env, _ = FileUtils.env_from_checkpoint(
             ckpt_dict=ckpt_dict,
@@ -206,7 +233,7 @@ def train_td3_agent(args, models, env, run, iteration, ckpt_dict, classifier):
     all_trajectories = []
     
     # During evaluation, store trajectories that exceed the reward threshold
-    for eval_ep in range(10):  # TODO: Used to be 30
+    for eval_ep in range(30):  # TODO: Used to be 30
         obs = eval_env.reset()
         trajectory_obs = []
         trajectory_actions = []
@@ -255,6 +282,7 @@ def train_td3_agent(args, models, env, run, iteration, ckpt_dict, classifier):
         video_path = f"{args.log_dir}/{run.id}/videos/run_{eval_ep}.mp4"
         imageio.mimsave(video_path, frames, fps=10)
         print(f"Saved video to {video_path}")
+        print("length of trajectory: ", len(trajectory_obs))
 
         all_trajectories.append((
             trajectory_obs,
@@ -263,6 +291,27 @@ def train_td3_agent(args, models, env, run, iteration, ckpt_dict, classifier):
             ))
     
     return all_trajectories
+
+def build_rl_model(args, agent_config, common_params):
+    if args.algorithm == 'PPO':
+        common_params['device'] = 'cpu'
+        model = PPO(
+                **common_params,
+                n_steps=128 // args.num_envs,
+                batch_size=128,
+                clip_range=0.2,
+            )
+    else:  # TD3
+        model = TD3(
+                **common_params,
+                buffer_size=agent_config['buffer_size'],
+                learning_starts=100,
+                batch_size=agent_config['batch_size'],
+                tau=agent_config['tau'],
+                policy_delay=agent_config['policy_delay'],
+            )
+        
+    return model
 
 if __name__ == "__main__":
     # Required Args (target envs & learners)
@@ -274,7 +323,7 @@ if __name__ == "__main__":
     parser.add_argument('--steps', default=40, type=int, help='length of snippets')
     parser.add_argument('--max_steps', default=200_000, type=int, help='length of max snippets (gt_traj_no_steps only)')  # idk
     parser.add_argument('--traj_noise', default=None, type=int, help='number of adjacent swaps (gt_traj_no_steps_noise only)')
-    parser.add_argument('--min_length', default=40,type=int, help='minimum length of trajectory generated by each agent')  # 1000 for mujoco
+    parser.add_argument('--min_length', default=0,type=int, help='minimum length of trajectory generated by each agent')  # 1000 for mujoco
     parser.add_argument('--num_layers', default=2, type=int, help='number layers of the reward network')
     parser.add_argument('--embedding_dims', default=256, type=int, help='embedding dims')
     parser.add_argument('--num_models', default=3, type=int, help='number of models to ensemble')  # 5 for mujoco
@@ -301,17 +350,20 @@ if __name__ == "__main__":
     parser.add_argument('--cliprew', default=10.0, type=float)
     parser.add_argument('--num_iterations', default=3, type=int, help='number of training iterations')
     parser.add_argument('--reward_threshold', default=1, type=float, help='reward threshold for adding trajectories to dataset')
+    parser.add_argument('--algorithm', default='PPO', choices=['PPO', 'TD3'], 
+                   help='RL algorithm to use for training')
     args = parser.parse_args()
 
     config = {
         "final_agent": {
             "policy_type": "MlpPolicy",
-            "total_timesteps": 50_000,
+            "total_timesteps": 200_000,
             "env_id": args.env_id,
-            # TD3-specific parameters
+            "device": "cuda" if torch.cuda.is_available() else "cpu",
             "learning_rate": 3e-4,
+            # TD3-specific parameters (only used when algorithm is TD3)
             "buffer_size": 1000000,
-            "batch_size": 256,
+            "batch_size": 512,
             "tau": 0.005,
             "policy_delay": 2
         }

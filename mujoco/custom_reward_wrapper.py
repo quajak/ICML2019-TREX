@@ -192,7 +192,7 @@ class TorchPreferenceRewardNormalized(TorchPreferenceReward):
                  self.ctrl_coeff * np.sum(action**2) + 
                  self.alive_bonus)
         
-        return obs, reward, done, terminated, info
+        return obs, reward / 10, done, terminated, info
 
     def render(self, mode="human", height=256, width=256):
         return self.env.render(mode=mode, height=height, width=width)

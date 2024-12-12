@@ -23,7 +23,7 @@ class GTTrajLevelDataset(GTDataset):
         for _ in tqdm(range(100)):
             first_obs = self.env.reset()
             obs, actions, rewards = [first_obs], [], []
-            max_length = 200
+            max_length = 250
             while len(obs) < max_length:  # we collect 1000 steps of trajectory for each agent
                 action = self.env.action_space.sample()
                 ob, reward, done, info = self.env.step(action)
