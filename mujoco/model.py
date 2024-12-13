@@ -74,6 +74,11 @@ class Model(nn.Module):
         # Convert samples to tensors
         x = torch.FloatTensor(np.stack([x for x, _, _ in D])).to(self.device)
         y = torch.FloatTensor(np.stack([y for _, y, _ in D])).to(self.device)
+         
+        # Add small gaussian noise
+        x = x + torch.randn_like(x) * 0.1 * torch.mean(x)
+        y = y + torch.randn_like(y) * 0.1 * torch.mean(y)
+
         labels = torch.LongTensor([l for _, _, l in D]).to(self.device)
         
         # Add noise to labels

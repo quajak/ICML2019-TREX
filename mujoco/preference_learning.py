@@ -1,6 +1,7 @@
 import argparse
 from pathlib import Path
 from random import randint, random
+from matplotlib import pyplot as plt
 import numpy as np
 import torch
 import torch.nn as nn
@@ -21,14 +22,14 @@ import os
 import robomimic.utils.file_utils as FileUtils
 
 from model import Model
-from custom_reward_wrapper import TorchPreferenceRewardNormalized
+from custom_reward_wrapper import TorchClassifierReward, TorchPreferenceRewardMinMaxNormalized, TorchPreferenceRewardNormalized, TorchSigmoidReward
 from gt_traj_dataset import GTTrajLevelDataset
 from classifier import Classifier
 from classifier_traj_dataset import ClassifierTrajDataset
 
 def get_agent(path, algorithm, device='cpu'):
     if algorithm == 'PPO':
-        agent = PPO.load(path, device=device)
+        agent = PPO.load(path, device='cpu')
     else:  # TD3
         agent = TD3.load(path, device=device)
     setattr(agent, 'model_path', str(path))
@@ -95,7 +96,7 @@ def train(args: dict, run):
         
         if args.preference_type == 'classifier':
             print("Training classifier...")
-            classifier = Classifier(args.env_id, robomimic=args.robomimic, include_action=args.include_action, device=device)
+            classifier = Classifier(args.env_id, robomimic=args.robomimic, include_action=args.include_action, device=device, noise_level=0.1)
             classifier.train_classifier(dataset, val_dataset)
             torch.save(classifier.state_dict(), f"{args.log_dir}/classifier_iter_{iteration}.pt")
             
@@ -130,6 +131,88 @@ def train(args: dict, run):
             models.append(model)
             torch.save(model.state_dict(), f"{args.log_dir}/model_{i}_iter_{iteration}.pt")
 
+        # Log both classifier and reward models on the validation dataset
+        # Log validation metrics for first 10 trajectories
+        print("\nValidation metrics for first 10 trajectories:")
+        print("Traj | Success | Avg Model Rewards | Classifier Score")
+        print("-" * 50)
+        
+        for i, traj in enumerate(validation_dataset.trajs[:10]):
+            # Get success status
+            success = "Success" if traj[4] == 1 else "Failure"
+            
+            # Calculate average reward from each model
+            model_rewards = []
+            obs = torch.FloatTensor(traj[1]).to(device)
+            if args.include_action:
+                actions = torch.FloatTensor(traj[2]).to(device)
+            
+            # Track per-step rewards for plotting
+            step_rewards = []
+            for model in models:
+                with torch.no_grad():
+                    if args.include_action:
+                        rewards = model.compute_reward(obs[:len(actions)], actions)
+                    else:
+                        rewards = model.compute_reward(obs)
+                    model_rewards.append(np.mean(rewards))
+                    step_rewards.append(rewards)
+            avg_model_reward = np.mean(model_rewards)
+            
+            # Average rewards across models for each timestep
+            step_rewards = np.mean(step_rewards, axis=0)
+            
+            # Get classifier predictions if using classifier
+            if args.preference_type == 'classifier':
+                # Get classifier scores for each timestep
+                classifier_scores = []
+                for t in range(len(obs)):
+                    if t >= len(actions):
+                        break
+                    if args.include_action:
+                        obs_t = torch.cat([obs[t:t+1], actions[t:t+1]], dim=1)
+                    else:
+                        obs_t = obs[t:t+1]
+                    with torch.no_grad():
+                        pred = classifier(obs_t)
+                        score = torch.softmax(pred, dim=1)[0,1].item()
+                        classifier_scores.append(score)
+                
+                avg_classifier_score = np.mean(classifier_scores)
+                print(f"{i:4d} | {success:7s} | {avg_model_reward:16.3f} | {avg_classifier_score:.3f}")
+                
+                # Plot rewards and classifier scores
+                # plt.figure(figsize=(10,5))
+                # plt.subplot(1,2,1)
+                # plt.plot(step_rewards)
+                # plt.title(f'Trajectory {i} Rewards')
+                # plt.xlabel('Step')
+                # plt.ylabel('Reward')
+                
+                # plt.subplot(1,2,2)
+                # plt.plot(classifier_scores)
+                # plt.title(f'Trajectory {i} Classifier Scores')
+                # plt.xlabel('Step')
+                # plt.ylabel('Score')
+                
+                # os.makedirs(f"{args.log_dir}/trajectory_plots", exist_ok=True)
+                # plt.savefig(f"{args.log_dir}/trajectory_plots/traj_{i}_iter_{iteration}.png")
+                # plt.close()
+                # print(f"Saved plot to {args.log_dir}/trajectory_plots/traj_{i}_iter_{iteration}.png")
+            else:
+                print(f"{i:4d} | {success:7s} | {avg_model_reward:16.3f} | N/A")
+                
+                # Plot just rewards
+                # plt.figure(figsize=(6,4))
+                # plt.plot(step_rewards)
+                # plt.title(f'Trajectory {i} Rewards')
+                # plt.xlabel('Step')
+                # plt.ylabel('Reward')
+                
+                # os.makedirs(f"{args.log_dir}/trajectory_plots", exist_ok=True)
+                # plt.savefig(f"{args.log_dir}/trajectory_plots/traj_{i}_iter_{iteration}.png")
+                # plt.close()
+
         # Train TD3 agent
         print("Training agent...")
         all_trajectories = train_rl_agent(args, models, env, run, iteration, ckpt_dict, classifier)
@@ -163,6 +246,9 @@ def train_rl_agent(args, models, env, run, iteration, ckpt_dict, classifier):
                 env = gym.make(agent_config["env_id"])
             
             env = TorchPreferenceRewardNormalized(env, args.num_models, args.log_dir, args.include_action, args.num_layers, args.embedding_dims, robomimic=args.robomimic, cliprew=args.cliprew)
+            # env = TorchPreferenceRewardMinMaxNormalized(env, args.num_models, args.log_dir, args.include_action, args.num_layers, args.embedding_dims, robomimic=args.robomimic)
+            # env = TorchSigmoidReward(env, args.num_models, args.log_dir, args.include_action, args.num_layers, args.embedding_dims, robomimic=args.robomimic)
+            # env = TorchClassifierReward(env, classifier, robomimic=args.robomimic, convert_obs=args.include_action)
             return env
 
         env = DummyVecEnv([make_indiv_env for _ in range(args.num_envs)], args.robomimic)
@@ -224,7 +310,9 @@ def train_rl_agent(args, models, env, run, iteration, ckpt_dict, classifier):
             render_offscreen=True,
             verbose=False,
         )
-
+        # eval_env = TorchClassifierReward(eval_env, classifier, robomimic=args.robomimic, convert_obs=args.include_action)
+        # eval_env = TorchSigmoidReward(eval_env, args.num_models, args.log_dir, args.include_action, args.num_layers, args.embedding_dims, robomimic=args.robomimic)
+        # eval_env = TorchPreferenceRewardMinMaxNormalized(eval_env, args.num_models, args.log_dir, args.include_action, args.num_layers, args.embedding_dims, robomimic=args.robomimic)
         eval_env = TorchPreferenceRewardNormalized(eval_env, args.num_models, args.log_dir, args.include_action, args.num_layers, args.embedding_dims, robomimic=args.robomimic, cliprew=args.cliprew)
     else:
         eval_env = gym.make(agent_config["env_id"])
@@ -305,7 +393,7 @@ def build_rl_model(args, agent_config, common_params):
         model = TD3(
                 **common_params,
                 buffer_size=agent_config['buffer_size'],
-                learning_starts=100,
+                learning_starts=500,
                 batch_size=agent_config['batch_size'],
                 tau=agent_config['tau'],
                 policy_delay=agent_config['policy_delay'],
@@ -339,7 +427,6 @@ if __name__ == "__main__":
     # Args for PPO
     parser.add_argument('--rl_runs', default=1, type=int)
     parser.add_argument('--ppo_log_path', default='ppo2')
-    parser.add_argument('--custom_reward', default="preference_normalized", help='preference or preference_normalized')
     parser.add_argument('--ctrl_coeff', default=0.0, type=float)
     parser.add_argument('--alive_bonus', default=0.0, type=float)
     parser.add_argument('--gamma', default=0.99, type=float)
@@ -348,7 +435,7 @@ if __name__ == "__main__":
     parser.add_argument('--iter', default=2000, type=int)  # how long to train the reward model - 5000 for mujoco and best performance on robomimic 
     parser.add_argument('--num_envs', default=4, type=int)
     parser.add_argument('--cliprew', default=10.0, type=float)
-    parser.add_argument('--num_iterations', default=3, type=int, help='number of training iterations')
+    parser.add_argument('--num_iterations', default=1, type=int, help='number of training iterations')
     parser.add_argument('--reward_threshold', default=1, type=float, help='reward threshold for adding trajectories to dataset')
     parser.add_argument('--algorithm', default='PPO', choices=['PPO', 'TD3'], 
                    help='RL algorithm to use for training')
@@ -357,15 +444,19 @@ if __name__ == "__main__":
     config = {
         "final_agent": {
             "policy_type": "MlpPolicy",
-            "total_timesteps": 200_000,
+            "total_timesteps": 10_000_000,
             "env_id": args.env_id,
-            "device": "cuda" if torch.cuda.is_available() else "cpu",
-            "learning_rate": 3e-4,
+            "device": "cuda" if args.algorithm == 'TD3' else "cpu",
+            "learning_rate": 1e-4,
             # TD3-specific parameters (only used when algorithm is TD3)
             "buffer_size": 1000000,
             "batch_size": 512,
             "tau": 0.005,
-            "policy_delay": 2
+            "policy_delay": 2,
+            "policy_noise": 0.2,  # Standard deviation of Gaussian noise added to actions for exploration
+            "noise_clip": 0.5,    # Maximum value of noise to add to actions
+            "target_policy_noise": 0.2,  # Noise added to target policy during critic update
+            "target_noise_clip": 0.5,    # Maximum noise added to target policy
         }
     }
     run = wandb.init(

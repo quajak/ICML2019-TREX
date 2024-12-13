@@ -9,9 +9,10 @@ if TYPE_CHECKING:
     from gt_traj_dataset import GTTrajDataset
 
 class Classifier(nn.Module):
-    def __init__(self, env_name, robomimic=False, include_action=False, device="cuda" if torch.cuda.is_available() else "cpu"):
+    def __init__(self, env_name, robomimic=False, include_action=False, device="cuda" if torch.cuda.is_available() else "cpu", noise_level=0.1):
         super(Classifier, self).__init__()
         self.num_timesteps = 1
+        self.noise_level = noise_level
         self.include_action = include_action
         feature_map = {
             'can': 23,
@@ -24,9 +25,9 @@ class Classifier(nn.Module):
         
         self.model = nn.Sequential(
             nn.Linear(self.num_timesteps * self.num_features + (self.num_actions if self.include_action else 0), 128),
-            nn.ReLU(),
-            # nn.Linear(128, 64),
             # nn.ReLU(),
+            # nn.Linear(128, 64),
+            nn.ReLU(),
             nn.Linear(128, 2)
         ).to(device)
 
@@ -43,13 +44,13 @@ class Classifier(nn.Module):
     def train_classifier(self, dataset: 'GTTrajDataset', val_dataset: 'GTTrajDataset'):
         config = {
             "batch_size": 64,
-            "epochs": 900 if self.robomimic else 20,
+            "epochs": 200 if self.robomimic else 20,
             "weight_decay": 1e-4
         }
         train_trajectories = dataset.trajs
         val_trajectories = val_dataset.trajs
         
-        optimizer = torch.optim.Adam(self.parameters(), lr=5e-4, weight_decay=config['weight_decay'])
+        optimizer = torch.optim.Adam(self.parameters(), lr=1e-4, weight_decay=config['weight_decay'])
         criterion = nn.CrossEntropyLoss()
 
         steps_per_epoch = 2 * len(train_trajectories) // config['batch_size']
@@ -73,6 +74,9 @@ class Classifier(nn.Module):
                         y.append(1 if traj[4] > 20 else 0)  # Success if max_x > 20
                 
                 x = torch.FloatTensor(np.array(x)).to(self.device)
+                # Add small gaussian noise
+                x = x + torch.randn_like(x) * self.noise_level * torch.mean(x)
+
                 labels = torch.LongTensor(y).to(self.device)
 
                 optimizer.zero_grad()
